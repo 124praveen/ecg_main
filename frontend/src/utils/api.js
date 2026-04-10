@@ -5,7 +5,7 @@
  * Binary endpoints (like /slice) return ArrayBuffer.
  */
 
-const BASE = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+const BASE = import.meta.env.VITE_BACKEND_URL || 'https://ecg-main-jjkn.onrender.com';
 
 async function request(path, opts = {}) {
   const res = await fetch(`${BASE}${path}`, {
