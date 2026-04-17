@@ -76,6 +76,8 @@ export async function decodeBse(hexString, blockIndex = 0) {
 
     const rawContent = await fs.promises.readFile(readPath, 'utf8');
     const allLines   = rawContent.split(/\r?\n/);
+    console.log(`[bseDecoder] JAR header lines:`, allLines.slice(0, 6));
+    console.log(`[bseDecoder] JAR total lines: ${allLines.length}`);
     const dataLines  = allLines.slice(6);
     const samples    = dataLines
       .map(l => l.trim())

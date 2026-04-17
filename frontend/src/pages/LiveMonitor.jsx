@@ -167,7 +167,8 @@ function LiveMonitor() {
   const blockFetchingRef = useRef(false);
   const pendingBlockFetchesRef = useRef(0); // MCT_BLOCK events queued while a fetch is in progress
   const stuckBlockCountRef = useRef(0);    // consecutive "no new samples" blocks from JAR
-  const bseFileRef = useRef([]);         // accumulated MCT file bytes across all blocks
+  const bseFileRef = useRef([]);         // accumulated MCT file bytes across all blocks (for export)
+  const referenceBlockRef = useRef([]);  // block 1 (reference frame) stored for pairing with each data block
   const decodedSampleCountRef = useRef(0); // samples already plotted from accumulated file
   const [blockStatus, setBlockStatus] = useState('');
 
@@ -326,27 +327,80 @@ function LiveMonitor() {
         ? Math.max(0, samples.length - windowSize)
         : 0;
 
-      // Remove DC baseline and auto-scale to fit canvas
-      let sum = 0;
-      for (let i = startIdx; i < startIdx + visibleSamples; i++) sum += samples[i];
-      const mean = sum / visibleSamples;
+      // ── Per-segment baseline removal ─────────────────────────
+      // Detect block boundaries (large value jumps) and remove
+      // each segment's DC baseline independently so block
+      // transition artifacts don't distort the waveform.
+      const JUMP_THRESHOLD = 5000;
+      const corrected = new Float64Array(visibleSamples);
 
+      // Find segment boundaries
+      const segStarts = [0];
+      for (let i = 1; i < visibleSamples; i++) {
+        if (Math.abs(samples[startIdx + i] - samples[startIdx + i - 1]) > JUMP_THRESHOLD) {
+          segStarts.push(i);
+        }
+      }
+      const segStartSet = new Set(segStarts);
+
+      // For each segment, subtract its own mean.
+      // Skip segments shorter than MIN_SEGMENT — these are initialization
+      // ramp fragments at block boundaries that produce noise spikes.
+      const MIN_SEGMENT = 100;
+      const skipSegments = new Set();
+      for (let s = 0; s < segStarts.length; s++) {
+        const from = segStarts[s];
+        const to = s + 1 < segStarts.length ? segStarts[s + 1] : visibleSamples;
+        if ((to - from) < MIN_SEGMENT) {
+          skipSegments.add(s);
+          for (let i = from; i < to; i++) corrected[i] = 0;
+        } else {
+          let segSum = 0;
+          for (let i = from; i < to; i++) segSum += samples[startIdx + i];
+          const segMean = segSum / (to - from);
+          for (let i = from; i < to; i++) {
+            corrected[i] = samples[startIdx + i] - segMean;
+          }
+        }
+      }
+
+      // Auto-scale from corrected values
       let peakAbs = 0;
-      for (let i = startIdx; i < startIdx + visibleSamples; i++) {
-        const dev = Math.abs(samples[i] - mean);
+      for (let i = 0; i < visibleSamples; i++) {
+        const dev = Math.abs(corrected[i]);
         if (dev > peakAbs) peakAbs = dev;
       }
       // gain slider acts as zoom: gain=10 default, gain=20 zooms in 2x
       const autoScale = peakAbs > 0 ? (height * 0.4) / peakAbs : 1;
       const scale = autoScale * (gain / 10);
 
+      // Build a set of sample indices that belong to skipped (short) segments
+      const skipIndices = new Set();
+      for (const s of skipSegments) {
+        const from = segStarts[s];
+        const to = s + 1 < segStarts.length ? segStarts[s + 1] : visibleSamples;
+        for (let i = from; i < to; i++) skipIndices.add(i);
+      }
+
       ctx.strokeStyle = lineColor;
       ctx.lineWidth = 1.2;
       ctx.beginPath();
+      let penDown = false;
       for (let i = 0; i < visibleSamples; i++) {
+        if (skipIndices.has(i)) {
+          if (penDown) { ctx.stroke(); ctx.beginPath(); penDown = false; }
+          continue;
+        }
         const x = i * pixelsPerSample;
-        const y = midY - (samples[startIdx + i] - mean) * scale;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        const y = midY - corrected[i] * scale;
+        if (!penDown || segStartSet.has(i)) {
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+          penDown = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
       }
       ctx.stroke();
 
@@ -529,36 +583,67 @@ function LiveMonitor() {
       // ── JAR-based BSE decoder ──────────────────────────────────────
       // Strip the 8-byte BLE transport+subcommand header and 4-byte CRC32 trailer.
       // The MCT data payload is bytes [8 .. len-4] = exactly 4096 bytes per block.
+      // JAR needs accumulated data (block 1 = reference frame + all subsequent blocks)
+      // to decode. Individual blocks cannot be decoded standalone.
       const BLE_HDR = 8;  // 7-byte protocol header + 1-byte sub-command response
       const BLE_CRC = 4;
       const currentBlock = blockIndexRef.current;
       const blockPayload = block.slice(BLE_HDR, block.length - BLE_CRC);
-      for (const b of blockPayload) bseFileRef.current.push(b);
-      blockIndexRef.current += 1;
-      for (let i = 0; i < block.length; i++) allRawBytesRef.current.push(block[i]);
-      const hexString = bseFileRef.current.map(b => b.toString(16).padStart(2,'0')).join('');
-      setBlockStatus(`Decoding block ${currentBlock} (${bseFileRef.current.length}B accumulated)...`);
-      const allSamples = await decodeBseBlock(hexString, 0);
-      const newSamples = allSamples.slice(decodedSampleCountRef.current);
-      if (newSamples.length > 0) decodedSampleCountRef.current = allSamples.length;
-      if (newSamples.length > 0) {
-        // BSE decode is the primary data source in MCT mode (device does NOT send 0x4F live packets)
-        for (const s of newSamples) allSamplesRef.current.push(s);
-        for (const s of newSamples) sampleQueueRef.current.push(s);
-        socket.emit('ecg:samples', newSamples);
-        // Update pagination
-        const ws = getWindowSize();
-        const newTotalPages = Math.max(1, Math.ceil(allSamplesRef.current.length / ws));
-        setTotalPages(newTotalPages);
-        if (autoFollowRef.current) {
-          const lastPage = newTotalPages - 1;
-          currentPageRef.current = lastPage;
-          setCurrentPage(lastPage);
-        }
-        console.log(`[BSE] +${newSamples.length} new samples (total: ${allSamplesRef.current.length})`);
-        setBlockStatus(`+${newSamples.length} samples (total: ${allSamplesRef.current.length}), next block ${blockIndexRef.current}`);
+
+      // Check if this block has actual ECG data or is all zeros
+      let nonZeroCount = 0;
+      // Skip first 160 bytes (header region) — check only the data portion
+      for (let i = 160; i < blockPayload.length; i++) {
+        if (blockPayload[i] !== 0) nonZeroCount++;
+      }
+      console.log(`[BSE] Block ${currentBlock}: ${blockPayload.length}B payload, ${nonZeroCount} non-zero data bytes (after header)`);
+
+      if (nonZeroCount < 10) {
+        console.warn(`[BSE] Block ${currentBlock} has no ECG data (all zeros) — skipping decode`);
+        blockIndexRef.current += 1;
+        for (let i = 0; i < block.length; i++) allRawBytesRef.current.push(block[i]);
+        allRawBlocksRef.current.push(Array.from(block));
+        setBlockStatus(`Block ${currentBlock}: empty (no ECG data) — skipped`);
       } else {
-        setBlockStatus(`Block ${blockIndexRef.current - 1}: no new samples`);
+        // Always accumulate for export
+        for (const b of blockPayload) bseFileRef.current.push(b);
+        blockIndexRef.current += 1;
+        for (let i = 0; i < block.length; i++) allRawBytesRef.current.push(block[i]);
+
+        if (currentBlock === 1) {
+          // Block 1 is the reference frame — store it, can't decode alone
+          referenceBlockRef.current = Array.from(blockPayload);
+          console.log(`[BSE] Block 1: reference frame stored (${blockPayload.length}B)`);
+          setBlockStatus(`Block 1: reference frame stored, waiting for data blocks...`);
+        } else if (referenceBlockRef.current.length > 0) {
+          // Data block: pair reference (block 1) + this block → JAR decodes ~15,000 samples
+          const combined = [...referenceBlockRef.current, ...Array.from(blockPayload)];
+          const hexString = combined.map(b => b.toString(16).padStart(2,'0')).join('');
+          console.log(`[BSE] Decoding block ${currentBlock}: ref(${referenceBlockRef.current.length}B) + data(${blockPayload.length}B) = ${combined.length}B`);
+          setBlockStatus(`Decoding block ${currentBlock} (ref + ${blockPayload.length}B)...`);
+          const newSamples = await decodeBseBlock(hexString, currentBlock);
+
+          console.log(`[BSE] Block ${currentBlock}: JAR returned ${newSamples.length} samples | allSamples before: ${allSamplesRef.current.length}`);
+
+          if (newSamples.length > 0) {
+            for (const s of newSamples) allSamplesRef.current.push(s);
+            for (const s of newSamples) sampleQueueRef.current.push(s);
+            socket.emit('ecg:samples', newSamples);
+            // Update pagination
+            const ws = getWindowSize();
+            const newTotalPages = Math.max(1, Math.ceil(allSamplesRef.current.length / ws));
+            setTotalPages(newTotalPages);
+            if (autoFollowRef.current) {
+              const lastPage = newTotalPages - 1;
+              currentPageRef.current = lastPage;
+              setCurrentPage(lastPage);
+            }
+            console.log(`[BSE] +${newSamples.length} new samples (total: ${allSamplesRef.current.length})`);
+            setBlockStatus(`+${newSamples.length} samples (total: ${allSamplesRef.current.length}), next block ${blockIndexRef.current}`);
+          } else {
+            setBlockStatus(`Block ${currentBlock}: no decodable samples`);
+          }
+        }
       }
     } catch (err) {
       console.error('[LiveMonitor] Block fetch error:', err.message);
@@ -582,6 +667,7 @@ function LiveMonitor() {
     setSwipeLoading(true);
     blockIndexRef.current = 1;        // block 1 → offset 0x10, block 2 → 0x20, etc.
     bseFileRef.current = [];
+    referenceBlockRef.current = [];
     decodedSampleCountRef.current = 0;
     pendingBlockFetchesRef.current = 0; // clear any leftover queued events from previous session
     blockFetchingRef.current = false;
